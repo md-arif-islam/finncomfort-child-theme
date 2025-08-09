@@ -158,3 +158,172 @@ function search_only_products($query)
     return $query;
 }
 add_filter('pre_get_posts', 'search_only_products');
+
+
+/**
+ * === Finn Comfort — Season ordering for CPT "schoenen" ===
+ * Uses ACF fields:
+ *  - Season_tag (Text)           e.g. "25 voorjaar", "25 najaar", "NOOS"
+ *  - season_order_index (Number) computed here
+ * Falls back to taxonomy 'seizoenen' term name if Season_tag is empty.
+ */
+
+/** Convert a season tag -> order index (NOOS last) */
+if (!function_exists('finn_season_order_index')) {
+    function finn_season_order_index($season_tag)
+    {
+        $season_tag = trim((string) $season_tag);
+        if ($season_tag === '') return PHP_INT_MAX; // unknown -> bottom
+
+        // Push NOOS to the very end when sorting ASC
+        if (stripos($season_tag, 'NOOS') !== false) return PHP_INT_MAX;
+
+        // Expect: "YY seizoen" (e.g. "25 voorjaar" or "25 najaar")
+        $parts = preg_split('/\s+/', $season_tag);
+        if (count($parts) !== 2 || !ctype_digit($parts[0])) return PHP_INT_MAX;
+
+        $tag_year   = (int) $parts[0];
+        $tag_season = mb_strtolower($parts[1]);
+
+        $map = ['voorjaar' => 0, 'najaar' => 1, 'spring' => 0, 'herfst' => 1, 'fall' => 1];
+        if (!isset($map[$tag_season])) return PHP_INT_MAX;
+
+        $now          = current_time('timestamp');
+        $current_year = (int) date('y', $now);                // two digits
+        $current_mode = ((int) date('n', $now) <= 6) ? 0 : 1; // 0=voorjaar, 1=najaar
+
+        $current_val = $current_year * 2 + $current_mode;
+        $tag_val     = $tag_year   * 2 + $map[$tag_season];
+
+        $index = $current_val - $tag_val;
+
+        // Future seasons go to the bottom
+        return ($index < 0) ? PHP_INT_MAX : $index;
+    }
+}
+
+
+/** If Season_tag empty, derive from 'seizoenen' term name (must be like "25 voorjaar") */
+function finn_guess_season_tag_from_terms($post_id)
+{
+    $terms = wp_get_post_terms($post_id, 'seizoenen', ['fields' => 'names']);
+    if (is_wp_error($terms) || empty($terms)) return '';
+    return trim((string) $terms[0]);
+}
+
+/** Compute + save index after each WP All Import row */
+add_action('pmxi_saved_post', function ($post_id) {
+    if (get_post_type($post_id) !== 'schoenen') return;
+
+    // Your ACF field is "Season_tag" (capital S). Also check lowercase in case you rename later.
+    $raw = get_post_meta($post_id, 'Season_tag', true);
+    if ($raw === '' || $raw === null) {
+        $raw = get_post_meta($post_id, 'season_tag', true);
+    }
+    if ($raw === '' || $raw === null) {
+        $raw = finn_guess_season_tag_from_terms($post_id);
+        if ($raw !== '') update_post_meta($post_id, 'Season_tag', $raw);
+    }
+
+    $idx = finn_season_order_index($raw);
+    update_post_meta($post_id, 'season_order_index', $idx);
+}, 10, 1);
+
+/** (One-time) backfill: visit ?finn_reindex_schoenen=1 while logged in as admin */
+add_action('init', function () {
+    if (!is_user_logged_in() || !current_user_can('manage_options')) return;
+    if (!isset($_GET['finn_reindex_schoenen'])) return;
+
+    $q = new WP_Query([
+        'post_type'      => 'schoenen',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+        'no_found_rows'  => true,
+    ]);
+
+    foreach ($q->posts as $id) {
+        $raw = get_post_meta($id, 'Season_tag', true);
+        if ($raw === '' || $raw === null) {
+            $raw = get_post_meta($id, 'season_tag', true);
+        }
+        if ($raw === '' || $raw === null) {
+            $raw = finn_guess_season_tag_from_terms($id);
+            if ($raw !== '') update_post_meta($id, 'Season_tag', $raw);
+        }
+        $idx = finn_season_order_index($raw);
+        update_post_meta($id, 'season_order_index', $idx);
+    }
+    wp_die('Reindex done for CPT "schoenen". Comment/remove this block after running once.');
+});
+
+/** Sort main queries that explicitly fetch schoenen (e.g. Home/Dames/Heren if they query this CPT) */
+add_action('pre_get_posts', function (WP_Query $q) {
+    if (is_admin() || !$q->is_main_query()) return;
+    $pt = $q->get('post_type');
+    $is_schoenen = (is_string($pt) && $pt === 'schoenen') || (is_array($pt) && in_array('schoenen', $pt, true));
+    if ($is_schoenen) {
+        $q->set('meta_key', 'season_order_index');
+        $q->set('orderby', 'meta_value_num');
+        $q->set('order', 'ASC');
+    }
+});
+
+/** (Optional) Show Season_tag + season_order_index in the admin list */
+add_filter('manage_schoenen_posts_columns', function ($cols) {
+    $cols['Season_tag'] = 'Season tag';
+    $cols['season_order_index'] = 'Season order';
+    return $cols;
+});
+add_action('manage_schoenen_posts_custom_column', function ($col, $post_id) {
+    if ($col === 'Season_tag') echo esc_html(get_post_meta($post_id, 'Season_tag', true));
+    if ($col === 'season_order_index') echo esc_html(get_post_meta($post_id, 'season_order_index', true));
+}, 10, 2);
+
+/** Shortcode for the two extra pages (category row, sorted by season) */
+add_shortcode('finn_shoe_row', function ($atts) {
+    $a = shortcode_atts([
+        'category'       => '',
+        'taxonomy'       => 'schoentypes', // change if your terms live elsewhere
+        'posts_per_page' => 12,
+        'post_type'      => 'schoenen',
+    ], $atts, 'finn_shoe_row');
+
+    $args = [
+        'post_type'      => $a['post_type'],
+        'posts_per_page' => (int)$a['posts_per_page'],
+        'meta_key'       => 'season_order_index',
+        'orderby'        => 'meta_value_num',
+        'order'          => 'ASC',
+        'no_found_rows'  => true,
+    ];
+    if (!empty($a['category'])) {
+        $args['tax_query'] = [[
+            'taxonomy' => $a['taxonomy'],
+            'field'    => 'slug',
+            'terms'    => $a['category'],
+        ]];
+    }
+
+    $q = new WP_Query($args);
+    ob_start();
+    if ($q->have_posts()) {
+        echo '<ul class="finn-shoe-row">';
+        while ($q->have_posts()) {
+            $q->the_post();
+            $title = get_the_title();
+            $perma = get_permalink();
+            $thumb = get_the_post_thumbnail(null, 'medium');
+            if (!$thumb) {
+                $acf_img_url = get_post_meta(get_the_ID(), 'afbeelding_url', true);
+                if ($acf_img_url) $thumb = '<img src="' . esc_url($acf_img_url) . '" alt="' . esc_attr($title) . '">';
+            }
+            echo '<li class="finn-shoe-item"><a href="' . esc_url($perma) . '">';
+            if ($thumb) echo $thumb;
+            echo '<h3 class="finn-shoe-title">' . esc_html($title) . '</h3>';
+            echo '</a></li>';
+        }
+        echo '</ul>';
+    }
+    wp_reset_postdata();
+    return ob_get_clean();
+});
