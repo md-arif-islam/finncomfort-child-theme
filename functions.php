@@ -227,6 +227,14 @@ add_action('pmxi_saved_post', function ($post_id) {
 
     $idx = finn_season_order_index($raw);
     update_post_meta($post_id, 'season_order_index', $idx);
+
+    // Generate AI description with hash checking
+    $general_description = schoenen_get_value($post_id, 'general_description');
+    if (!empty($general_description)) {
+        // Schedule AI generation with staggered timing to avoid rate limits
+        $delay = rand(30, 180); // Random delay between 30-180 seconds
+        wp_schedule_single_event(time() + $delay, 'generate_ai_description_hook', array($post_id));
+    }
 }, 10, 1);
 
 /** (One-time) backfill: visit ?finn_reindex_schoenen=1 while logged in as admin */
@@ -407,3 +415,124 @@ add_shortcode('schoenen_terms', function ($atts) {
     }
     return $a['before'] . implode(esc_html($a['sep']), $out) . $a['after'];
 });
+
+// AI Description Generation Function
+function generate_ai_description($post_id)
+{
+    $general_description = schoenen_get_value($post_id, 'general_description');
+    $post_title = get_the_title($post_id);
+
+    if (empty($general_description)) {
+        return '';
+    }
+
+    // Create hash of source content to detect changes
+    $content_hash = md5($post_title . $general_description);
+    $stored_hash = get_post_meta($post_id, 'ai_description_hash', true);
+
+    // Only generate if hash has changed or doesn't exist
+    if ($content_hash === $stored_hash) {
+        return get_post_meta($post_id, 'ai_description', true);
+    }
+
+    $prompt = <<<PROMPT
+# Product Description Prompt
+
+You are a product description writer. Write a new, unique description of **3 to 5 sentences** for each product in Dutch. Keep the text clear and informative, without exaggeration. **Output must be HTML only** — do not include anything before or after the HTML.
+
+## 1. Research
+- Search online for information about this specific product.
+- Preferably use sources in languages other than Dutch.
+- Carefully verify that the information you find is about the exact same product with the same name.
+
+## 2. Processing
+- Combine the original description with the new information you've found.
+- Fully rewrite the text: **do not** copy sentences or literal phrases from the sources.
+- Ensure the new description flows naturally, with a consistent style.
+
+## 3. Output Structure Rules
+- HTML only — no other text, explanations, or formatting outside the HTML.
+- Use only the following HTML tags: `<h2>`, `<p>`, `<ul>`, `<li>`.
+- `<h2>` for the product title, `<p>` for description sentences, `<ul><li>` for listing specific features.
+- No other HTML tags allowed.
+
+---
+
+**Original description:**
+{$post_title}
+{$general_description}
+
+---
+
+**Important:**
+- Final output **must** be HTML only.
+- Must be written in **Dutch**.
+- 3–5 sentences total.
+PROMPT;
+
+    $body = [
+        'model' => 'gpt-5',
+        // 'tools' => [
+        //     ['type' => 'web_search']
+        // ],
+        'input' => $prompt,
+    ];
+
+    $response = wp_remote_post('https://api.openai.com/v1/responses', [
+        'timeout' => 90,
+        'headers' => [
+            'Content-Type' => 'application/json',
+            'Authorization' => 'Bearer ' . FINNCOMFORT_OPENAI_API,
+        ],
+        'body' => wp_json_encode($body),
+        'sslverify' => true,
+    ]);
+
+    if (is_wp_error($response)) {
+        error_log('OpenAI API error: ' . $response->get_error_message());
+        return '';
+    }
+
+    $data = json_decode(wp_remote_retrieve_body($response), true);
+
+    // Handle rate limiting
+    if (isset($data['error']) && $data['error']['code'] === 'rate_limit_exceeded') {
+        // Extract wait time from error message
+        $wait_time = 2; // Default 2 seconds
+        if (preg_match('/Please try again in ([\d.]+)s/', $data['error']['message'], $matches)) {
+            $wait_time = (float)$matches[1] + 1; // Add 1 second buffer
+        }
+        
+        // Reschedule for later
+        wp_schedule_single_event(time() + ceil($wait_time), 'generate_ai_description_hook', array($post_id));
+        return '';
+    }
+
+    // Find the message content in output array
+    $ai_description = '';
+    if (isset($data['output']) && is_array($data['output'])) {
+        foreach ($data['output'] as $output_item) {
+            if (isset($output_item['type']) && $output_item['type'] === 'message' && 
+                isset($output_item['content'][0]['text'])) {
+                $ai_description = trim($output_item['content'][0]['text']);
+                break;
+            }
+        }
+    }
+    
+    if (!empty($ai_description)) {
+        update_post_meta($post_id, 'ai_description', $ai_description);
+        update_post_meta($post_id, 'ai_description_hash', $content_hash);
+        return $ai_description;
+    } else {
+        error_log('OpenAI API error: ' . print_r($data, true));
+        return '';
+    }
+}
+
+// Hook to handle scheduled AI description generation
+add_action('generate_ai_description_hook', function ($post_id) {
+    generate_ai_description($post_id);
+});
+
+?>
