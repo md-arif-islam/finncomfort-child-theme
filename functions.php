@@ -327,3 +327,83 @@ add_shortcode('finn_shoe_row', function ($atts) {
     wp_reset_postdata();
     return ob_get_clean();
 });
+
+
+/**
+ * Get meta value (ACF first, then post meta).
+ */
+function schoenen_get_value($post_id, $field)
+{
+    if (! $post_id || ! $field) return '';
+    if (function_exists('get_field')) {
+        $val = get_field($field, $post_id);
+        if ($val !== null && $val !== '') return $val;
+    }
+    $val = get_post_meta($post_id, $field, true);
+    return ($val !== '' && $val !== null) ? $val : '';
+}
+
+/**
+ * [schoenen name="afbeelding_url" context="attr|text|html" post_id=""]
+ *
+ * - name    : (required) exact ACF/meta field slug
+ * - context : attr (default) -> esc_attr(); text -> esc_html(); html -> wp_kses_post()
+ * - post_id : optional; defaults to current post
+ *
+ * Safe to use inside HTML attributes, e.g.:
+ *   <img src="[schoenen name='afbeelding_url']" alt="[schoenen name='naam']" />
+ */
+add_shortcode('schoenen', function ($atts) {
+    $a = shortcode_atts([
+        'name'    => '',
+        'context' => 'attr',   // attr|text|html
+        'post_id' => '',
+    ], $atts, 'schoenen');
+
+    $post_id = $a['post_id'] ? intval($a['post_id']) : get_the_ID();
+    if (! $post_id || ! $a['name']) return '';
+
+    $val = schoenen_get_value($post_id, $a['name']);
+    if ($val === '') return '';
+
+    switch ($a['context']) {
+        case 'html':
+            return wp_kses_post(is_string($val) ? $val : '');
+        case 'text':
+            return esc_html(is_scalar($val) ? (string)$val : '');
+        case 'attr':
+        default:
+            return esc_attr(is_scalar($val) ? (string)$val : '');
+    }
+});
+
+/**
+ * [schoenen_terms taxonomy="merken" linked="yes" sep=", " before="" after="" post_id=""]
+ *
+ * Outputs native CPT UI taxonomy terms for the current (or given) post.
+ */
+add_shortcode('schoenen_terms', function ($atts) {
+    $a = shortcode_atts([
+        'taxonomy' => 'merken',
+        'linked'   => 'yes',
+        'sep'      => ', ',
+        'before'   => '',
+        'after'    => '',
+        'post_id'  => '',
+    ], $atts, 'schoenen_terms');
+
+    $post_id = $a['post_id'] ? intval($a['post_id']) : get_the_ID();
+    if (! $post_id) return '';
+
+    $terms = get_the_terms($post_id, $a['taxonomy']);
+    if (is_wp_error($terms) || empty($terms)) return '';
+
+    $out = [];
+    foreach ($terms as $t) {
+        $name = esc_html($t->name);
+        $out[] = ($a['linked'] === 'yes')
+            ? '<a href="' . esc_url(get_term_link($t)) . '">' . $name . '</a>'
+            : $name;
+    }
+    return $a['before'] . implode(esc_html($a['sep']), $out) . $a['after'];
+});
