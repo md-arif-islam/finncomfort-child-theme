@@ -1015,4 +1015,31 @@ add_action('wp_ajax_clear_debug_log', function() {
     }
 });
 
+// Shortcode to display AI description or fallback to general_description
+add_shortcode('schoenen_smart_description', function($atts) {
+    $atts = shortcode_atts([
+        'name' => 'general_description',
+        'context' => 'html'
+    ], $atts);
+    
+    global $post;
+    if (!$post) return '';
+    
+    // First try to get AI description
+    $ai_description = get_post_meta($post->ID, 'ai_description', true);
+    
+    if (!empty($ai_description)) {
+        return $ai_description;
+    }
+    
+    // Fallback to ACF field
+    $general_description = get_field($atts['name'], $post->ID);
+    
+    if ($atts['context'] === 'html' && !empty($general_description)) {
+        return wpautop($general_description);
+    }
+    
+    return $general_description ?: '';
+});
+
 ?>
