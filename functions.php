@@ -211,11 +211,155 @@ function finn_guess_season_tag_from_terms($post_id)
     return trim((string) $terms[0]);
 }
 
-/** Compute + save index after each WP All Import row */
-add_action('pmxi_saved_post', function ($post_id) {
-    if (get_post_type($post_id) !== 'schoenen') return;
+// Lightweight protection: Store AI data in memory instead of DB during import
+if (!isset($GLOBALS['wp_import_ai_backup'])) {
+    $GLOBALS['wp_import_ai_backup'] = [];
+}
 
-    // Your ACF field is "Season_tag" (capital S). Also check lowercase in case you rename later.
+// Try multiple hooks to ensure backup happens
+add_action('pmxi_before_post_import', function($post_id) {
+    error_log("AI Protection: pmxi_before_post_import hook fired for post {$post_id}");
+    if (get_post_type($post_id) === 'schoenen') {
+        // Store AI data in memory (much faster than DB operations)
+        $ai_desc = get_post_meta($post_id, 'ai_description', true);
+        $ai_hash = get_post_meta($post_id, 'ai_description_hash', true);
+        
+        if (!empty($ai_desc) || !empty($ai_hash)) {
+            // Dual backup: Memory + Database for maximum protection
+            $GLOBALS['wp_import_ai_backup'][$post_id] = [
+                'desc' => $ai_desc,
+                'hash' => $ai_hash
+            ];
+            
+            // Also backup to database as fallback
+            if (!empty($ai_desc)) {
+                update_post_meta($post_id, '_ai_desc_backup', $ai_desc);
+            }
+            if (!empty($ai_hash)) {
+                update_post_meta($post_id, '_ai_hash_backup', $ai_hash);
+            }
+            
+            error_log("AI Protection: Backed up data for post {$post_id} - Desc: " . (!empty($ai_desc) ? 'YES' : 'NO') . ", Hash: " . (!empty($ai_hash) ? 'YES' : 'NO'));
+        }
+    }
+}, 10, 1);
+
+// Additional backup hooks for maximum coverage
+add_action('pmxi_before_post_update', function($post_id) {
+    error_log("AI Protection: pmxi_before_post_update hook fired for post {$post_id}");
+    if (get_post_type($post_id) === 'schoenen') {
+        $ai_desc = get_post_meta($post_id, 'ai_description', true);
+        $ai_hash = get_post_meta($post_id, 'ai_description_hash', true);
+        
+        if (!empty($ai_desc) || !empty($ai_hash)) {
+            $GLOBALS['wp_import_ai_backup'][$post_id] = [
+                'desc' => $ai_desc,
+                'hash' => $ai_hash
+            ];
+            
+            if (!empty($ai_desc)) {
+                update_post_meta($post_id, '_ai_desc_backup', $ai_desc);
+            }
+            if (!empty($ai_hash)) {
+                update_post_meta($post_id, '_ai_hash_backup', $ai_hash);
+            }
+            
+            error_log("AI Protection: BACKUP via pmxi_before_post_update for post {$post_id}");
+        }
+    }
+}, 10, 1);
+
+add_action('wp_insert_post', function($post_id, $post, $update) {
+    if ($update && get_post_type($post_id) === 'schoenen' && defined('PMXI_VERSION')) {
+        error_log("AI Protection: wp_insert_post hook fired during import for post {$post_id}");
+        $ai_desc = get_post_meta($post_id, 'ai_description', true);
+        $ai_hash = get_post_meta($post_id, 'ai_description_hash', true);
+        
+        if (!empty($ai_desc) || !empty($ai_hash)) {
+            $GLOBALS['wp_import_ai_backup'][$post_id] = [
+                'desc' => $ai_desc,
+                'hash' => $ai_hash
+            ];
+            
+            if (!empty($ai_desc)) {
+                update_post_meta($post_id, '_ai_desc_backup', $ai_desc);
+            }
+            if (!empty($ai_hash)) {
+                update_post_meta($post_id, '_ai_hash_backup', $ai_hash);
+            }
+            
+            error_log("AI Protection: BACKUP via wp_insert_post for post {$post_id}");
+        }
+    }
+}, 5, 3); // Higher priority to run before other hooks
+
+// Restore AI descriptions after WP All Import if they were deleted
+add_action('pmxi_saved_post', function($post_id) {
+    if (get_post_type($post_id) !== 'schoenen') return;
+    
+    // Fast restoration from memory backup
+    if (isset($GLOBALS['wp_import_ai_backup'][$post_id])) {
+        $backup = $GLOBALS['wp_import_ai_backup'][$post_id];
+        
+        $current_desc = get_post_meta($post_id, 'ai_description', true);
+        $current_hash = get_post_meta($post_id, 'ai_description_hash', true);
+        
+        $restored_desc = false;
+        $restored_hash = false;
+        
+        // Restore if current data is missing
+        if (empty($current_desc) && !empty($backup['desc'])) {
+            update_post_meta($post_id, 'ai_description', $backup['desc']);
+            $restored_desc = true;
+        }
+        
+        if (empty($current_hash) && !empty($backup['hash'])) {
+            update_post_meta($post_id, 'ai_description_hash', $backup['hash']);
+            $restored_hash = true;
+        }
+        
+        if ($restored_desc || $restored_hash) {
+            error_log("AI Protection: Restored data for post {$post_id} - Desc: " . ($restored_desc ? 'YES' : 'NO') . ", Hash: " . ($restored_hash ? 'YES' : 'NO'));
+        }
+        
+        // Clean up memory
+        unset($GLOBALS['wp_import_ai_backup'][$post_id]);
+    } else {
+        // Fallback: Try database backup if memory backup not found
+        $current_desc = get_post_meta($post_id, 'ai_description', true);
+        $current_hash = get_post_meta($post_id, 'ai_description_hash', true);
+        
+        $restored_desc = false;
+        $restored_hash = false;
+        
+        if (empty($current_desc)) {
+            $db_backup_desc = get_post_meta($post_id, '_ai_desc_backup', true);
+            if (!empty($db_backup_desc)) {
+                update_post_meta($post_id, 'ai_description', $db_backup_desc);
+                $restored_desc = true;
+            }
+        }
+        
+        if (empty($current_hash)) {
+            $db_backup_hash = get_post_meta($post_id, '_ai_hash_backup', true);
+            if (!empty($db_backup_hash)) {
+                update_post_meta($post_id, 'ai_description_hash', $db_backup_hash);
+                $restored_hash = true;
+            }
+        }
+        
+        if ($restored_desc || $restored_hash) {
+            error_log("AI Protection: Restored from DB backup for post {$post_id} - Desc: " . ($restored_desc ? 'YES' : 'NO') . ", Hash: " . ($restored_hash ? 'YES' : 'NO'));
+        } elseif (empty($current_desc)) {
+            error_log("AI Protection: WARNING - Post {$post_id} has no AI description and no backup found!");
+        }
+    }
+    
+    // Clean up database backups
+    delete_post_meta($post_id, '_ai_desc_backup');
+    delete_post_meta($post_id, '_ai_hash_backup');
+    
+    // Continue with existing logic for season index and AI generation
     $raw = get_post_meta($post_id, 'Season_tag', true);
     if ($raw === '' || $raw === null) {
         $raw = get_post_meta($post_id, 'season_tag', true);
@@ -243,7 +387,14 @@ add_action('pmxi_saved_post', function ($post_id) {
             wp_schedule_single_event(time() + $delay, 'generate_ai_description_hook', array($post_id));
         }
     }
-}, 10, 1);
+}, 20, 1); // Higher priority to run after restoration
+
+// Clean up memory after import completes
+add_action('pmxi_after_xml_import', function() {
+    if (isset($GLOBALS['wp_import_ai_backup'])) {
+        unset($GLOBALS['wp_import_ai_backup']);
+    }
+});
 
 /** (One-time) backfill: visit ?finn_reindex_schoenen=1 while logged in as admin */
 add_action('init', function () {
@@ -557,24 +708,25 @@ add_action('generate_ai_description_hook', function ($post_id) {
 });
 
 // Add admin menu for AI Description debugging
-add_action('admin_menu', function() {
+add_action('admin_menu', function () {
     add_management_page(
         'AI Description Debug',
-        'AI Description Debug', 
+        'AI Description Debug',
         'manage_options',
         'ai-description-debug',
         'ai_description_debug_page'
     );
 });
 
-function ai_description_debug_page() {
+function ai_description_debug_page()
+{
     echo "<div class='wrap'>";
     echo "<h1>AI Description Debug Status</h1>";
-    
+
     // Check WordPress cron
     $cron_jobs = get_option('cron');
     $ai_jobs = 0;
-    
+
     if ($cron_jobs) {
         foreach ($cron_jobs as $timestamp => $jobs) {
             if (isset($jobs['generate_ai_description_hook'])) {
@@ -582,9 +734,9 @@ function ai_description_debug_page() {
             }
         }
     }
-    
+
     echo "<p>AI descriptions in queue: <strong>{$ai_jobs}</strong></p>";
-    
+
     // Show last cron run time
     $cron_last_run = get_option('_transient_doing_cron');
     if ($cron_last_run) {
@@ -594,7 +746,7 @@ function ai_description_debug_page() {
     } else {
         echo "<p>Last processing: <strong>Unknown</strong></p>";
     }
-    
+
     // Check recent posts without AI descriptions
     $posts_without_ai = new WP_Query([
         'post_type' => 'schoenen',
@@ -613,9 +765,9 @@ function ai_description_debug_page() {
             ]
         ]
     ]);
-    
+
     echo "<p>Posts without AI descriptions: <strong>{$posts_without_ai->found_posts}</strong></p>";
-    
+
     // Check posts with AI descriptions
     $posts_with_ai = new WP_Query([
         'post_type' => 'schoenen',
@@ -628,23 +780,23 @@ function ai_description_debug_page() {
             ]
         ]
     ]);
-    
+
     echo "<p>Posts WITH AI descriptions: <strong>{$posts_with_ai->found_posts}</strong></p>";
-    
+
     echo "<h3>Manual Processing</h3>";
     echo "<div style='margin-bottom: 20px;'>";
     echo "<button class='button button-primary' onclick='processDirectly()' style='margin-right: 10px;'>Process 3 Posts Directly</button>";
     echo "<button class='button button-secondary' onclick='triggerAllPosts()' style='margin-right: 10px;'>Process All Posts (Cron)</button>";
     echo "<button class='button' onclick='triggerManualGeneration()' style='margin-right: 10px;'>Trigger 5 Posts (Cron)</button>";
     echo "</div>";
-    
+
     echo "<h3>Cleanup Actions</h3>";
     echo "<div style='margin-bottom: 20px;'>";
     echo "<button class='button button-secondary' onclick='clearCronQueue()' style='margin-right: 10px; background-color: #f56565; border-color: #f56565; color: white;'>Clear All AI Cron Jobs</button>";
     echo "<button class='button button-secondary' onclick='deleteAllAIDescriptions()' style='margin-right: 10px; background-color: #e53e3e; border-color: #e53e3e; color: white;'>Delete All AI Descriptions</button>";
     echo "<button class='button button-secondary' onclick='clearDebugLog()' style='background-color: #fd7f6f; border-color: #fd7f6f; color: white;'>Clear Debug Log</button>";
     echo "</div>";
-    
+
     echo "<p><small>";
     echo "<strong>Direct processing:</strong> Works immediately, processes 3 posts with delays.<br>";
     echo "<strong>Force WP Cron:</strong> Attempts to run all queued cron jobs manually.<br>";
@@ -653,17 +805,17 @@ function ai_description_debug_page() {
     echo "<strong style='color: red;'>Delete Descriptions:</strong> Removes all AI descriptions from database.<br>";
     echo "<strong style='color: red;'>Clear Debug Log:</strong> Removes all entries from debug.log file.";
     echo "</small></p>";
-    
+
     // Check recent debug log entries
     $debug_log_path = WP_CONTENT_DIR . '/debug.log';
     if (file_exists($debug_log_path)) {
         echo "<h3>Recent AI Description Log Entries:</h3>";
         $log_content = file_get_contents($debug_log_path);
         $lines = explode("\n", $log_content);
-        $ai_lines = array_filter($lines, function($line) {
+        $ai_lines = array_filter($lines, function ($line) {
             return strpos($line, 'AI Description:') !== false;
         });
-        
+
         if (!empty($ai_lines)) {
             echo "<pre style='background: #f1f1f1; padding: 10px; max-height: 300px; overflow-y: scroll;'>";
             foreach (array_slice(array_reverse($ai_lines), 0, 20) as $line) {
@@ -674,7 +826,7 @@ function ai_description_debug_page() {
             echo "<p>No AI Description log entries found.</p>";
         }
     }
-    
+
     echo "<script>
     function processDirectly() {
         if (confirm('This will process 3 posts directly and may take 10-15 seconds. Continue?')) {
@@ -806,12 +958,12 @@ function ai_description_debug_page() {
         });
     }
     </script>";
-    
+
     echo "</div>";
 }
 
 // AJAX handlers for manual triggering
-add_action('wp_ajax_trigger_manual_ai_generation', function() {
+add_action('wp_ajax_trigger_manual_ai_generation', function () {
     $posts = new WP_Query([
         'post_type' => 'schoenen',
         'posts_per_page' => 5,
@@ -828,7 +980,7 @@ add_action('wp_ajax_trigger_manual_ai_generation', function() {
             ]
         ]
     ]);
-    
+
     $count = 0;
     if ($posts->have_posts()) {
         while ($posts->have_posts()) {
@@ -838,11 +990,11 @@ add_action('wp_ajax_trigger_manual_ai_generation', function() {
         }
     }
     wp_reset_postdata();
-    
+
     wp_die("Triggered {$count} posts");
 });
 
-add_action('wp_ajax_trigger_single_ai_generation', function() {
+add_action('wp_ajax_trigger_single_ai_generation', function () {
     $post_id = intval($_POST['post_id']);
     if ($post_id) {
         wp_schedule_single_event(time() + 5, 'generate_ai_description_hook', array($post_id));
@@ -852,11 +1004,11 @@ add_action('wp_ajax_trigger_single_ai_generation', function() {
 });
 
 // Alternative processing when WP Cron is disabled
-add_action('wp_ajax_process_ai_queue_direct', function() {
+add_action('wp_ajax_process_ai_queue_direct', function () {
     if (!current_user_can('manage_options')) {
         wp_die('Unauthorized');
     }
-    
+
     // Process a few posts directly without cron
     $posts = new WP_Query([
         'post_type' => 'schoenen',
@@ -874,18 +1026,18 @@ add_action('wp_ajax_process_ai_queue_direct', function() {
             ]
         ]
     ]);
-    
+
     $processed = 0;
     if ($posts->have_posts()) {
         while ($posts->have_posts()) {
             $posts->the_post();
             error_log("AI Description: Processing directly - Post ID " . get_the_ID());
-            
+
             // Add delay between requests to avoid rate limits
             if ($processed > 0) {
                 sleep(3); // 3 second delay between each request
             }
-            
+
             $result = generate_ai_description(get_the_ID(), true); // Force generate
             if (!empty($result)) {
                 error_log("AI Description: Direct processing successful for Post ID " . get_the_ID());
@@ -897,32 +1049,32 @@ add_action('wp_ajax_process_ai_queue_direct', function() {
         }
     }
     wp_reset_postdata();
-    
+
     wp_die("Processed {$processed} posts directly. Refresh debug page to see updated counts.");
 });
 
 // Force run WP Cron manually
-add_action('wp_ajax_force_cron_run', function() {
+add_action('wp_ajax_force_cron_run', function () {
     if (!current_user_can('manage_options')) {
         wp_die('Unauthorized');
     }
-    
+
     // Trigger WP Cron manually
     $cron_url = site_url('wp-cron.php');
     $response = wp_remote_get($cron_url, [
         'timeout' => 30,
         'blocking' => false // Don't wait for response
     ]);
-    
+
     // Also try to run cron directly
     if (function_exists('spawn_cron')) {
         spawn_cron();
     }
-    
+
     // Count AI description cron jobs before and after
     $cron_jobs = get_option('cron');
     $ai_jobs_after = 0;
-    
+
     if ($cron_jobs) {
         foreach ($cron_jobs as $timestamp => $jobs) {
             if (isset($jobs['generate_ai_description_hook'])) {
@@ -930,7 +1082,7 @@ add_action('wp_ajax_force_cron_run', function() {
             }
         }
     }
-    
+
     if (is_wp_error($response)) {
         wp_die("Failed to trigger WP Cron: " . $response->get_error_message() . ". Remaining AI jobs: {$ai_jobs_after}");
     } else {
@@ -939,11 +1091,11 @@ add_action('wp_ajax_force_cron_run', function() {
 });
 
 // Trigger all posts without AI descriptions
-add_action('wp_ajax_trigger_all_posts', function() {
+add_action('wp_ajax_trigger_all_posts', function () {
     if (!current_user_can('manage_options')) {
         wp_die('Unauthorized');
     }
-    
+
     // Get all posts without AI descriptions
     $posts_without_ai = new WP_Query([
         'post_type' => 'schoenen',
@@ -962,10 +1114,10 @@ add_action('wp_ajax_trigger_all_posts', function() {
             ]
         ]
     ]);
-    
+
     $scheduled_count = 0;
     $current_time = time();
-    
+
     foreach ($posts_without_ai->posts as $index => $post) {
         $general_description = schoenen_get_value($post->ID, 'general_description');
         if (!empty($general_description)) {
@@ -975,25 +1127,25 @@ add_action('wp_ajax_trigger_all_posts', function() {
             $scheduled_count++;
         }
     }
-    
+
     wp_die("Scheduled {$scheduled_count} posts for AI description generation with staggered timing (5 second intervals starting in 30 seconds).");
 });
 
 // Clear all AI description cron jobs
-add_action('wp_ajax_clear_ai_cron_queue', function() {
+add_action('wp_ajax_clear_ai_cron_queue', function () {
     if (!current_user_can('manage_options')) {
         wp_die('Unauthorized');
     }
-    
+
     $cron_jobs = get_option('cron');
     $cleared_count = 0;
-    
+
     if ($cron_jobs) {
         foreach ($cron_jobs as $timestamp => $jobs) {
             if (isset($jobs['generate_ai_description_hook'])) {
                 $cleared_count += count($jobs['generate_ai_description_hook']);
                 unset($cron_jobs[$timestamp]['generate_ai_description_hook']);
-                
+
                 // Remove timestamp entry if no other jobs
                 if (empty($cron_jobs[$timestamp])) {
                     unset($cron_jobs[$timestamp]);
@@ -1002,64 +1154,66 @@ add_action('wp_ajax_clear_ai_cron_queue', function() {
         }
         update_option('cron', $cron_jobs);
     }
-    
+
     // Also clear any currently running spawned cron processes
     wp_clear_scheduled_hook('generate_ai_description_hook');
-    
+
     wp_die("Cleared {$cleared_count} AI description cron jobs from queue and stopped any running processes.");
 });
 
 // Delete all AI descriptions from database
-add_action('wp_ajax_delete_all_ai_descriptions', function() {
+add_action('wp_ajax_delete_all_ai_descriptions', function () {
     if (!current_user_can('manage_options')) {
         wp_die('Unauthorized');
     }
-    
+
     global $wpdb;
-    
+
     // Delete ai_description meta
     $deleted_descriptions = $wpdb->query(
         "DELETE FROM {$wpdb->postmeta} WHERE meta_key = 'ai_description'"
     );
-    
+
     // Delete ai_description_hash meta
     $deleted_hashes = $wpdb->query(
         "DELETE FROM {$wpdb->postmeta} WHERE meta_key = 'ai_description_hash'"
     );
-    
+
     wp_die("Deleted {$deleted_descriptions} AI descriptions and {$deleted_hashes} hash entries from database.");
 });
 
 // Clear AI description log entries only
-add_action('wp_ajax_clear_debug_log', function() {
+add_action('wp_ajax_clear_debug_log', function () {
     if (!current_user_can('manage_options')) {
         wp_die('Unauthorized');
     }
-    
+
     $debug_log_path = WP_CONTENT_DIR . '/debug.log';
-    
+
     if (file_exists($debug_log_path)) {
         $log_content = file_get_contents($debug_log_path);
         $lines = explode("\n", $log_content);
-        
+
         $filtered_lines = [];
         $removed_count = 0;
-        
+
         foreach ($lines as $line) {
             // Keep lines that don't contain AI description related messages
-            if (strpos($line, 'AI Description') === false && 
+            if (
+                strpos($line, 'AI Description') === false &&
                 strpos($line, 'OpenAI API') === false &&
                 strpos($line, 'generate_ai_description') === false &&
-                strpos($line, 'ai_description') === false) {
+                strpos($line, 'ai_description') === false
+            ) {
                 $filtered_lines[] = $line;
             } else {
                 $removed_count++;
             }
         }
-        
+
         // Write back the filtered content
         file_put_contents($debug_log_path, implode("\n", $filtered_lines));
-        
+
         wp_die("Cleared {$removed_count} AI description log entries from debug log.");
     } else {
         wp_die("Debug log file not found.");
@@ -1067,30 +1221,83 @@ add_action('wp_ajax_clear_debug_log', function() {
 });
 
 // Shortcode to display AI description or fallback to general_description
-add_shortcode('schoenen_smart_description', function($atts) {
+add_shortcode('schoenen_smart_description', function ($atts) {
     $atts = shortcode_atts([
         'name' => 'general_description',
         'context' => 'html'
     ], $atts);
-    
+
     global $post;
     if (!$post) return '';
-    
+
     // First try to get AI description
     $ai_description = get_post_meta($post->ID, 'ai_description', true);
-    
+
     if (!empty($ai_description)) {
         return $ai_description;
     }
-    
+
     // Fallback to ACF field
     $general_description = get_field($atts['name'], $post->ID);
-    
+
     if ($atts['context'] === 'html' && !empty($general_description)) {
         return wpautop($general_description);
     }
-    
+
     return $general_description ?: '';
 });
 
-?>
+// Smart price display shortcode - shows both prices when on sale, single price when not
+add_shortcode('schoenen_smart_price', function($atts) {
+    $atts = shortcode_atts([
+        'post_id' => ''
+    ], $atts);
+    
+    global $post;
+    $post_id = $atts['post_id'] ? intval($atts['post_id']) : ($post ? $post->ID : 0);
+    
+    if (!$post_id) return '';
+    
+    // Check if product has discount
+    $korting = schoenen_get_value($post_id, 'korting');
+    $min_prijs = schoenen_get_value($post_id, 'min_prijs');
+    
+    if ($korting == '1') {
+        // Product on sale - show both prices with space
+        $min_prijs_zonder_korting = schoenen_get_value($post_id, 'min_prijs_zonder_korting');
+        $output = '<span class="sale-price"><s>€' . esc_html($min_prijs_zonder_korting) . '</s></span>';
+        $output .= ' <span>€' . esc_html($min_prijs) . '</span>';
+        return $output;
+    } else {
+        // Regular price only
+        return '<span>€' . esc_html($min_prijs) . '</span>';
+    }
+});
+
+// Prefix shoes taxonomies with their label, e.g. "Breedtematen: Wijdte-h".
+function shoes_term_heading_with_tax_prefix($title)
+{
+    if (is_tax()) {
+        $term = get_queried_object();
+        if ($term && ! is_wp_error($term)) {
+            // Only these taxonomies (attached to CPT "schoenen")
+            $allowed = array('merken', 'kleuren', 'seizoenen', 'maten', 'groepen', 'schoentypes', 'breedtematen', 'korting', 'finnamic');
+
+            if (in_array($term->taxonomy, $allowed, true)) {
+                $taxonomy = get_taxonomy($term->taxonomy);
+                $prefix   = ! empty($taxonomy->labels->name) ? $taxonomy->labels->name : ucfirst($term->taxonomy);
+
+                // Make first letter uppercase so "wijdte-h" -> "Wijdte-h"
+                $term_name = ucfirst($term->name);
+
+                // If you prefer to capitalize every segment (e.g. "Wijdte-H"), use this instead:
+                // $term_name = implode('-', array_map('ucfirst', explode('-', $term->name)));
+
+                return sprintf('%s: %s', $prefix, $term_name);
+            }
+        }
+    }
+    return $title;
+}
+add_filter('single_term_title', 'shoes_term_heading_with_tax_prefix', 10, 1);
+add_filter('get_the_archive_title', 'shoes_term_heading_with_tax_prefix', 10, 1);
