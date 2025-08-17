@@ -231,9 +231,17 @@ add_action('pmxi_saved_post', function ($post_id) {
     // Generate AI description with hash checking
     $general_description = schoenen_get_value($post_id, 'general_description');
     if (!empty($general_description)) {
-        // Schedule AI generation with staggered timing to avoid rate limits
-        $delay = rand(30, 180); // Random delay between 30-180 seconds
-        wp_schedule_single_event(time() + $delay, 'generate_ai_description_hook', array($post_id));
+        // Check if AI description needs regeneration using hash
+        $post_title = get_the_title($post_id);
+        $content_hash = md5($post_title . $general_description);
+        $stored_hash = get_post_meta($post_id, 'ai_description_hash', true);
+        
+        // Only schedule if hash changed or doesn't exist
+        if ($content_hash !== $stored_hash) {
+            // Schedule AI generation with staggered timing to avoid rate limits
+            $delay = rand(30, 180); // Random delay between 30-180 seconds
+            wp_schedule_single_event(time() + $delay, 'generate_ai_description_hook', array($post_id));
+        }
     }
 }, 10, 1);
 
@@ -489,7 +497,7 @@ PROMPT;
             'Authorization' => 'Bearer ' . FINNCOMFORT_OPENAI_API,
         ],
         'body' => wp_json_encode($body),
-        'sslverify' => true,
+        'sslverify' => false,  // Disable SSL verification temporarily
     ]);
 
     if (is_wp_error($response)) {
@@ -626,7 +634,7 @@ function ai_description_debug_page() {
     echo "<h3>Manual Processing</h3>";
     echo "<div style='margin-bottom: 20px;'>";
     echo "<button class='button button-primary' onclick='processDirectly()' style='margin-right: 10px;'>Process 3 Posts Directly</button>";
-    echo "<button class='button button-secondary' onclick='forceCronRun()' style='margin-right: 10px;'>Force Run WP Cron</button>";
+    echo "<button class='button button-secondary' onclick='triggerAllPosts()' style='margin-right: 10px;'>Process All Posts (Cron)</button>";
     echo "<button class='button' onclick='triggerManualGeneration()' style='margin-right: 10px;'>Trigger 5 Posts (Cron)</button>";
     echo "</div>";
     
@@ -689,23 +697,25 @@ function ai_description_debug_page() {
         }
     }
     
-    function forceCronRun() {
-        if (confirm('This will attempt to run all queued WP Cron jobs. Continue?')) {
+    function triggerAllPosts() {
+        if (confirm('This will trigger AI generation for ALL posts without descriptions. This may take a while. Continue?')) {
             var btn = event.target;
             btn.disabled = true;
-            btn.textContent = 'Running Cron...';
+            btn.textContent = 'Processing All Posts...';
             
             fetch(ajaxurl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: 'action=force_cron_run'
+                body: 'action=trigger_all_posts'
             }).then(response => response.text()).then(data => {
                 alert(data);
-                location.reload();
+                setTimeout(() => {
+                    location.reload();
+                }, 1000);
             }).catch(error => {
                 alert('Error: ' + error);
                 btn.disabled = false;
-                btn.textContent = 'Force Run WP Cron';
+                btn.textContent = 'Process All Posts (Cron)';
             });
         }
     }
@@ -926,6 +936,47 @@ add_action('wp_ajax_force_cron_run', function() {
     } else {
         wp_die("WP Cron triggered manually. Remaining AI jobs: {$ai_jobs_after}. Check debug log in a few minutes.");
     }
+});
+
+// Trigger all posts without AI descriptions
+add_action('wp_ajax_trigger_all_posts', function() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Unauthorized');
+    }
+    
+    // Get all posts without AI descriptions
+    $posts_without_ai = new WP_Query([
+        'post_type' => 'schoenen',
+        'post_status' => 'publish',
+        'posts_per_page' => -1,
+        'meta_query' => [
+            'relation' => 'OR',
+            [
+                'key' => 'ai_description',
+                'compare' => 'NOT EXISTS'
+            ],
+            [
+                'key' => 'ai_description',
+                'value' => '',
+                'compare' => '='
+            ]
+        ]
+    ]);
+    
+    $scheduled_count = 0;
+    $current_time = time();
+    
+    foreach ($posts_without_ai->posts as $index => $post) {
+        $general_description = schoenen_get_value($post->ID, 'general_description');
+        if (!empty($general_description)) {
+            // Schedule with staggered timing
+            $delay = 30 + ($index * 5); // Start at 30 seconds, add 5 seconds per post
+            wp_schedule_single_event($current_time + $delay, 'generate_ai_description_hook', array($post->ID));
+            $scheduled_count++;
+        }
+    }
+    
+    wp_die("Scheduled {$scheduled_count} posts for AI description generation with staggered timing (5 second intervals starting in 30 seconds).");
 });
 
 // Clear all AI description cron jobs
